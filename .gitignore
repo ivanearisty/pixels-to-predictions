@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+*.egg-info/
+.venv/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+
+# Uv venv metadata inside cache
+.uv-cache/
+
+# Data + competition artifacts (too big for git)
+data/
+outputs/
+results/submissions/*.csv
+results/ablations/*.json
+results/figures/*.png
+results/renders/
+
+# Per-run logs and PID files (runtime artifacts; keep dir structure only)
+logs/**/*
+!logs/.gitkeep
+
+# Planning: not tracked
+planning/
+
+# Logit npz files (per-variant inference cache, too big for git)
+results/logits/
+
+# LaTeX build intermediates (keep .tex / .bib / .sty / .pdf)
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.log
+report/*.out
+report/*.toc
+report/pdflatex*.log
+report/bibtex.log
+
+# HuggingFace / transformers caches
+.cache/
+*.safetensors
+*.bin
+
+# Unsloth compilation cache (if we end up using it on Thor)
+unsloth_compiled_cache/
+
+# Secrets
+.env
+.env.*
+kaggle.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep these empty dirs tracked
+!outputs/.gitkeep
+!results/.gitkeep
+!results/submissions/.gitkeep
+!results/ablations/.gitkeep
+!results/figures/.gitkeep
+!logs/.gitkeep

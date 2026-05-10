@@ -1,0 +1,232 @@
+% ACL 2023 Format — DL Spring 2026 Kaggle Contest Final Report
+\documentclass[11pt]{article}
+
+\usepackage[preprint]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\title{Pixels to Predictions: \\
+A LoRA + Logit-Ensemble Approach to \\
+Multimodal Multiple-Choice Science QA}
+
+\author{Ivan Aristy \\
+  NYU Tandon School of Engineering \\
+  CS-GY 9223 / ECE-GY 7123: Deep Learning, Spring 2026 \\
+  \texttt{ia2194@nyu.edu}}
+
+\begin{document}
+\maketitle
+\sloppy
+
+\begin{abstract}
+We present a system for the DL Spring 2026 ``Pixels to Predictions'' Kaggle competition, in which a vision-language model selects the correct multiple-choice answer for science questions given an image, question text, and choices. Hard constraints fix the base model to \texttt{HuggingFaceTB/SmolVLM-500M-Instruct} and cap trainable parameters at 5M. Our approach combines DoRA adapters on the language model's attention and MLP projections, single-letter SFT, multiple-choice format (MCF) logit scoring at inference, and a simple equally-weighted logit ensemble over three trained variants. Final submission scored \textbf{0.6418} on the public Kaggle leaderboard and \textbf{0.6477} private, up from a 0.6137 single-model public baseline. Training and inference ran end-to-end on a single RTX 2000 Ada (16 GB VRAM).
+\end{abstract}
+
+% ==============================================================================
+\section{Introduction}
+% ==============================================================================
+
+The DL Spring 2026 ``Pixels to Predictions'' competition asks teams to fine-tune SmolVLM-500M-Instruct \citep{smolvlm2024} on a multimodal multiple-choice question (MCQ) corpus derived from ScienceQA \citep{lu2022scienceqa}. Each example pairs an image with a question, a list of 2-5 lettered choices, optional contextual text (\texttt{hint}, \texttt{lecture}), and pedagogical metadata (\texttt{subject}, \texttt{topic}, \texttt{grade}). Performance is graded by classification accuracy on a hidden test split.
+
+Three constraints shape the design space:
+
+\begin{enumerate}
+    \item \textbf{Frozen base model.} Only \texttt{SmolVLM-500M-Instruct} may be used; no other pretrained models or external datasets are allowed.
+    \item \textbf{5M trainable parameter cap.} Adapters, classification heads, and any other updated weights together must not exceed 5M parameters.
+    \item \textbf{Offline evaluation.} Submissions run in a no-internet Kaggle environment.
+\end{enumerate}
+
+The work is therefore not ``pick a model'' but rather ``compose a small set of techniques that the parameter budget permits.'' We make two contributions:
+
+\begin{enumerate}
+    \item A LoRA-based fine-tuning recipe with DoRA on q/v/gate/up/down projections of SmolVLM's language model, holding the vision tower and modality connector frozen, that fits comfortably under 5M trainable parameters and lifts the model from 37\% trivial-baseline accuracy to 61\% single-model val accuracy.
+    \item A simple equally-weighted logit ensemble over three trained variants (different LoRA shapes and image resolutions) that adds 0.86 pp on top of the best single model on validation, and translated to a +2.81 pp public-leaderboard lift over the single-variant baseline.
+\end{enumerate}
+
+% ==============================================================================
+\section{Dataset}
+% ==============================================================================
+
+The competition data is drawn from the ScienceQA family \citep{lu2022scienceqa} but ships preprocessed and split for this contest:
+
+\begin{itemize}
+    \item \textbf{Train:} 3,109 examples
+    \item \textbf{Val:} 1,048 examples
+    \item \textbf{Test:} 1,008 examples (labels withheld)
+    \item \textbf{Images:} all 5,165 are PNG files at varying resolution (median 378$\times$238 pixels; long tail to 760$\times$595).
+\end{itemize}
+
+CSV columns include \texttt{id}, \texttt{image\_path}, \texttt{question}, JSON-encoded \texttt{choices}, \texttt{num\_choices}, \texttt{answer} (0-indexed integer; train/val only), plus rich text context (\texttt{hint}, \texttt{lecture}, \texttt{solution}) and metadata (\texttt{task}, \texttt{grade}, \texttt{subject}, \texttt{topic}, \texttt{category}, \texttt{skill}).
+
+\paragraph{Baselines.} A trivial constant predictor (always choose answer 0) scores \textasciitilde 37\% on val due to mild positional bias in the answer-key distribution. Random guessing weighted by per-row \texttt{num\_choices} scores \textasciitilde 35\%. Any non-trivial system must clear these bars convincingly.
+
+\paragraph{Distributional summary.} Subject distribution is skewed (73\% natural science, 25\% social science, 2\% language science). The \texttt{num\_choices} distribution is roughly 21\%/50\%/25\%/4\% for $k\in\{2,3,4,5\}$. Image content varies widely: object photographs (where the answer typically lives in the \texttt{hint} text), small square diagrams (Punnett squares, force diagrams; image is essential), and wide aspect-ratio maps and timelines (where dense text labels are critical).
+
+% ==============================================================================
+\section{Method}
+% ==============================================================================
+
+\subsection{Adapter design}
+
+We adapt only the language-model side of SmolVLM. The vision encoder (SigLIP) and modality connector remain entirely frozen; LoRA target modules are matched against suffix names \texttt{q\_proj},\allowbreak\ \texttt{v\_proj},\allowbreak\ \texttt{gate\_proj},\allowbreak\ \texttt{up\_proj},\allowbreak\ \texttt{down\_proj} with \texttt{exclude\_modules=}\allowbreak\texttt{r".*vision\_model.*"} so the same suffixes in the vision tower do not silently inherit adapters.
+
+We use DoRA \citep{liu2024dora} on top of LoRA: the magnitude-direction decomposition adds $\sim$1\% extra trainable params per layer for documented gains on small VLMs. With $r=8$ and $\alpha=16$ over 32 transformer layers in the language model, we land at 3,758,080 trainable parameters --- about 75\% of the 5M cap, leaving headroom for higher ranks or wider targets when needed. A budget-audit module (\texttt{budget.py}) recomputes the trainable count immediately after PEFT wrapping and refuses to start training if it exceeds 5M.
+
+\subsection{Training format}
+
+Each training example becomes a single-turn chat:
+
+\begin{itemize}
+    \item \textbf{User:} an image, then optional metadata, optional \texttt{lecture}, the \texttt{question}, optional \texttt{hint}, the lettered \texttt{choices}, and a closing instruction (``Reply with a single letter, nothing else.'').
+    \item \textbf{Assistant:} a single letter --- \texttt{`` A''}, \texttt{`` B''}, \ldots, tokenized as a single token in SmolVLM's BPE.
+\end{itemize}
+
+The collator chat-templates the messages, encodes the prompt-only and full-template separately, and sets \texttt{labels[:prompt\_len] = -100} so the loss is computed only on the answer-letter tokens. Training uses bf16, AdamW with cosine LR schedule (peak $2\!\times\!10^{-4}$, 3\% warmup), batch size 1 with gradient accumulation 8 (effective batch 8), 1 epoch (\textasciitilde 389 optimizer steps), gradient checkpointing on. We deliberately avoid 2-epoch training based on the loss-curve plateau observed in epoch 1.
+
+\subsection{Inference: multiple-choice format (MCF) scoring}
+
+At inference we run a single forward pass per example. The chat template ends in \texttt{``Assistant:''}, after which the model expects to emit one of \texttt{`` A''}, \texttt{`` B''}, \ldots. We extract logits at position $-1$, restrict to the per-sample valid letter token IDs (the leading-space-letter tokens 330, 389, 340, 422, 414 in SmolLM2's vocabulary, \textit{not} the bare-letter tokens 49--53), and take the argmax.
+
+A common subtle bug: SmolLM2's BPE tokenizes \texttt{`` A''} (space-A) as a single token distinct from the bare \texttt{``A''}. Our chat template's training target is \texttt{`` B''}; reading bare-letter logits at position $-1$ instead lands on a vocabulary position the model has not been trained to emit, which silently regresses accuracy by \textasciitilde 1.2 pp per variant.
+
+% ==============================================================================
+\section{Experimentation}
+\label{sec:experiments}
+% ==============================================================================
+
+We trained three LoRA variants. All variants used the same data, prompt format, and seed (42); they differ only along the axes labeled in Table~\ref{tab:variants}. All variants enable DoRA on top of LoRA, applied to LLM modules only; v2 additionally enables rsLoRA ($\alpha/\sqrt{r}$ scaling rather than $\alpha/r$, useful at higher ranks).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lllrrr}
+\toprule
+Variant & Targets & $r$ & params & img.\ size & val acc \\
+\midrule
+v1 & q,v + MLP & 8  & 3.76M & 384 & 0.6107 \\
+v2 & q,v only  & 32 & 3.32M & 384 & 0.5716 \\
+v3 & q,v + MLP & 10 & 4.64M & 512 & 0.6107 \\
+\bottomrule
+\end{tabular}
+\caption{Trained variants. \textit{Targets} lists LoRA target-module suffixes (LLM only). \textit{Val acc} is logit-mode at position $-1$ over space-letter token IDs.}
+\label{tab:variants}
+\end{table}
+
+\paragraph{Logit ensemble.} For each pair of (variant, val/test split), the predict pipeline saves per-sample 5-letter logits to \texttt{results/logits/}\allowbreak\texttt{\{variant\}-\{split\}.npz}. We then sum the per-variant logits with equal weight before per-sample masked argmax over \texttt{num\_choices}. The simple sum produced consistent val-set lifts: v1+v3 reached 0.6174 (+0.67 pp over either alone), and the full v1+v2+v3 sum reached 0.6193 (+0.86 pp).
+
+\subsection{Ablation studies}
+\label{sec:ablations}
+
+Beyond the variant sweep, we ran three targeted ablation studies that informed the rest of the design.
+
+\paragraph{Prompt format ablation.} We held the v1 checkpoint fixed and varied only the prompt template at inference (Table~\ref{tab:prompts}). Adding pedagogical metadata (\texttt{subject}/\texttt{topic}/\texttt{grade}) to the user turn \textit{hurt} accuracy ($-1.05$ pp) --- likely because at 384 px the model's effective context budget is already tight, and metadata displaces visual evidence. Dropping the \texttt{lecture} block hurt as well ($-3.34$ pp), confirming the long lecture text carries useful answer signal for k-12 questions despite its verbosity. The biggest miss was rephrasing the prompt to ``The answer is''-style cloze ($-7.59$ pp): SmolVLM was trained on a chat template that expects an explicit instruction, and reframing it as cloze pushed inference off-distribution.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+prompt variant & val acc \\
+\midrule
+drop\_metadata (winning) & \textbf{0.6145} \\
+baseline\_trained        & 0.6040 \\
+no\_lecture\_no\_metadata & 0.5840 \\
+drop\_lecture            & 0.5706 \\
+answer\_is style          & 0.5286 \\
+answer\_is + minimal      & 0.5105 \\
+\bottomrule
+\end{tabular}
+\caption{Inference-time prompt ablations on v1. Removing metadata is a free $+1.05$ pp; removing lecture or reframing as cloze regresses sharply.}
+\label{tab:prompts}
+\end{table}
+
+\paragraph{Inference-mode ablation.} For the same v1 checkpoint, we compared three decoding strategies at \texttt{temperature=0.0} (we deliberately ran fully deterministic --- no temperature sweep, since the answer space is a fixed set of 2-5 letter tokens and sampling adds variance without offsetting bias):
+
+\begin{itemize}
+    \item \textbf{Greedy generate-mode.} Sample 4 new tokens with \texttt{do\_sample=False}, then regex-parse the first letter A-E. Val: 0.6145. Cost: $\sim$5$\times$ slower per sample because of the autoregressive loop.
+    \item \textbf{Logit at $-1$ (bare-letter token IDs).} Read \texttt{logits[:,-1,:]} after \texttt{add\_generation\_prompt=True}, restrict to bare-letter token IDs (49-53). Val: 0.5983. Faster than greedy but $-1.24$ pp.
+    \item \textbf{Logit at $-1$ (space-letter token IDs, the fix).} Same forward pass; restrict to leading-space-letter IDs (330, 389, 340, 422, 414). Val: 0.6107.
+\end{itemize}
+
+The space-vs-bare letter-token bug was diagnostically important: SmolLM2's BPE encodes \texttt{`` A''} (with leading space, the actual training target) as a different token from bare \texttt{``A''}. Reading bare-letter logits silently regresses by 1.0--1.3 pp across all variants without any error trail. The same fix lifted v1 ($+1.24$ pp), v2 ($+1.05$ pp), and v3 ($+1.34$ pp) consistently.
+
+\paragraph{Image-size ablation (v3 vs.\ v1).} v3 doubled the image-side resolution from 384 px to 512 px under an otherwise identical recipe. Single-model val was unchanged (0.6107 in logit-mode), but v3 contributed positive ensemble diversity: the v1+v2 sum stops at 0.6126, while adding v3 lifts to 0.6193. We interpret this as the larger image producing a different per-sample error pattern (more useful on dense-text maps and timelines) without raw single-model accuracy lift.
+
+% ==============================================================================
+\section{Results}
+% ==============================================================================
+
+\subsection{Submission chronology}
+
+We made two Kaggle submissions:
+
+\begin{itemize}
+    \item \textbf{Baseline} (v1, generate-mode, drop-metadata prompt): public LB \textbf{0.6137}, val 0.6145. Tight val/public alignment ($\Delta\!\approx\!0.001$) confirmed val is a faithful proxy for test.
+    \item \textbf{Final} (v1+v2+v3 logit ensemble): public LB \textbf{0.6418}, private \textbf{0.6477}, val 0.6193.
+\end{itemize}
+
+\subsection{Final ensemble}
+
+The final submission summed per-sample 5-letter logits across v1, v2, and v3 with equal weight, then took the per-sample masked argmax (restricted to the row's \texttt{num\_choices}). All three variants used the same space-letter logit-mode at position $-1$ for consistency. The val-set lift over the best single variant is modest ($+0.86$ pp), but it expanded on the held-out splits ($+2.81$ pp public over the v1 baseline, with private at 0.6477) --- consistent with the ensemble's per-sample diversity generalizing rather than overfitting to val.
+
+% ==============================================================================
+\section{Conclusion}
+% ==============================================================================
+
+\subsection{What worked}
+
+\begin{itemize}
+    \item \textbf{MCF logit-mode inference at position $-1$} gave deterministic, parse-free predictions and was 5$\times$ faster than greedy generation.
+    \item \textbf{Space-letter token IDs} for the masked argmax were the right inference target --- the bug-fixed version recovered 1.0--1.3 pp consistently across all three variants.
+    \item \textbf{DoRA on LLM attention + MLP at $r=8$} fit comfortably under 5M trainable parameters with 25\% headroom and produced strong generalization across all variants.
+    \item \textbf{Logit ensembling} added a further $+0.86$ pp val and $+2.81$ pp public over the best single model with zero retraining cost.
+\end{itemize}
+
+\subsection{What did not work}
+
+\begin{itemize}
+    \item \textbf{Including pedagogical metadata in the prompt}: counter-intuitively hurt val accuracy ($-1.05$ pp on v1) --- the metadata displaced visual evidence in the model's context.
+    \item \textbf{Cloze-style prompt rephrasing}: the ``The answer is''-style template regressed v1 by 7.59 pp; SmolVLM expects an explicit instruction format, not free-form completion.
+    \item \textbf{Reading bare-letter logits at position $-1$}: silently regressed accuracy by 1.0--1.3 pp until we identified that SmolLM2's BPE distinguishes \texttt{`` A''} from \texttt{``A''}.
+\end{itemize}
+
+\subsection{The 0.64 vs.\ 0.90 leaderboard gap}
+
+The strongest competitors achieved test accuracy near 0.90, well above our 0.64. Closing that gap likely requires \textit{stacking} multiple techniques we did not have time to compose: vision-encoder LoRA, modality-connector LoRA at higher rank, multi-seed bagging, true cloze (choice-text) scoring, prompt-variant data augmentation, and aggressive test-time augmentation. None of these is individually a magic technique; the gap is composition.
+
+% ==============================================================================
+\section{Reproducibility}
+% ==============================================================================
+
+\paragraph{Repository.} \url{https://github.com/ivanearisty/pixels-to-predictions}.
+
+\paragraph{Note on publication date.} We realized late that this repository was never pushed to GitHub during the active competition window --- development happened locally, and we did not configure a remote until after the submission deadline. The single-commit snapshot reflects the code state that produced the submitted predictions; only the publication timeline is out of order. Apologies for the inconsistency.
+
+\paragraph{Hardware.} A single NVIDIA RTX 2000 Ada (16 GB VRAM, driver 580.142). Total GPU time across the three trained variants: \textasciitilde 2 hours.
+
+\paragraph{Software.} Python 3.11, PyTorch 2.11+cu130, transformers 4.57.6, peft (DoRA-capable), trl 0.29, all installed via \texttt{uv}. Strict \texttt{ruff check} and \texttt{mypy --strict} on \texttt{src/pixels\_to\_predictions/} pass.
+
+\paragraph{Steps to reproduce the final submission.}
+
+\begin{enumerate}
+    \item \texttt{uv venv \&\& uv pip install -e ".[dev,gpu-x86]"}.
+    \item \texttt{python scripts/setup\_data.py --zip pixels-to-predictions.zip}.
+    \item Train v1, v2, and v3 via \texttt{python -m}\allowbreak\ \texttt{pixels\_to\_predictions.train}\allowbreak\ \texttt{...}.
+    \item Score each variant on val and test with \texttt{python -m}\allowbreak\ \texttt{pixels\_to\_predictions.predict}\allowbreak\ \texttt{--inference-mode logits}\allowbreak\ \texttt{--save-logits ...}.
+    \item Sum per-sample logits across v1+v2+v3 with equal weight and take the masked argmax to produce the submission.
+\end{enumerate}
+
+\paragraph{AI tooling.} We used Claude Code (Anthropic) as a coding assistant for scaffolding, ablation-harness boilerplate, and bookkeeping. Experimental design, ablation interpretation, and submission decisions were made by the author.
+
+\bibliography{references}
+
+\end{document}
